@@ -416,6 +416,53 @@ class UnifiedEngine:
             except Exception as e:
                 logger.error(f"Failed to upsert {row['Ticker']}: {e}")
 
+    def _generate_explanation(self, ticker: str, style: str, pillars: Dict, weights: Dict, total_score: float, rank_ic: float) -> str:
+        """Generate natural language explanation for V-Score"""
+        # Find strongest and weakest pillars
+        pillar_scores = {
+            "fundamentals": pillars["fundamentals"],
+            "momentum": pillars["momentum"],
+            "risk": pillars["risk"],
+            "sentiment": pillars["sentiment"]
+        }
+        sorted_pillars = sorted(pillar_scores.items(), key=lambda x: x[1], reverse=True)
+        strongest = sorted_pillars[0]
+        weakest = sorted_pillars[-1]
+
+        # Overall conviction
+        if total_score >= 80:
+            overall = "Strong conviction"
+        elif total_score >= 60:
+            overall = "Moderate conviction"
+        elif total_score >= 40:
+            overall = "Neutral outlook"
+        else:
+            overall = "Cautious stance"
+
+        # Strength descriptions
+        strength_map = {
+            "fundamentals": "solid fundamentals",
+            "momentum": "strong price momentum", 
+            "risk": "favorable risk profile",
+            "sentiment": "positive market sentiment"
+        }
+        weakness_map = {
+            "fundamentals": "weaker fundamentals",
+            "momentum": "momentum concerns",
+            "risk": "elevated risk levels", 
+            "sentiment": "cautious sentiment"
+        }
+
+        strength_desc = strength_map.get(strongest[0], strongest[0])
+        weakness_desc = weakness_map.get(weakest[0], weakest[0])
+
+        # Most influential pillar
+        contributions = {k: weights.get(k, 0.25) * v for k, v in pillar_scores.items()}
+        most_influential = max(contributions, key=contributions.get)
+        weight_pct = int(weights.get(most_influential, 0.25) * 100)
+
+        return f"{overall}. {style} stock showing {strength_desc} but {weakness_desc}. {most_influential.capitalize()} driving {weight_pct}% of score."
+
     async def run(self):
         # 1. Gather all unique tickers
         all_tickers = list(set([t for tickers in UNIVERSES.values() for t in tickers]))
@@ -493,23 +540,24 @@ class UnifiedEngine:
                      row['sentiment'] * weights['sentiment'])
                 score = (1 / (1 + np.exp(-z))) * 100
                 
-                # IMPORTANT: We need to pass back the raw (0-100) scores, not the Z-scores?
-                # The prompt asks for 'fundamentals', 'momentum' etc which are usually 0-100 for display.
-                # But 'row' here has Z-SCORES because we transformed strict df in place above.
-                # We need to re-calculate or store raw scores?
-                # Actually, the user asked to map "Raw pillar Z-scores" to "fundamentals... (convert to 0-100)"
-                # Transforming Z-score back to 0-100: 50 + (z * 10)? Or just use Sigmoid on them?
-                # Simpler: We have the `UnifiedEngine`... wait, `history_rows` had the raw 0-100 scores!
-                # But `latest_df` is derived from `df` which has Z-scores.
-                # Workaround: Re-calculate the raw score for the single latest point OR
-                # inverse transform if we knew mean/std.
-                # Better: Just use a standard mapping for Z to 0-100 for display: 50 + (z*20) clipped ?
-                # Or just output the Z-score and let frontend handle?
-                # The requirements say: "Raw pillar Z-scores -> `fundamentals`... (convert to 0-100)"
-                # So I will do a simple conversion: 50 + (z * 20).
-                
                 def z_to_100(v):
                     return max(0, min(100, 50 + (v * 20)))
+
+                pillars_100 = {
+                    "fundamentals": z_to_100(row['fundamentals']),
+                    "momentum": z_to_100(row['momentum']),
+                    "risk": z_to_100(row['risk']),
+                    "sentiment": z_to_100(row['sentiment'])
+                }
+
+                explanation = self._generate_explanation(
+                    ticker=row['ticker'],
+                    style=style,
+                    pillars=pillars_100,
+                    weights=weights,
+                    total_score=round(score, 1),
+                    rank_ic=round(ic, 4)
+                )
 
                 master_results.append({
                     "Ticker": row['ticker'],
@@ -517,10 +565,11 @@ class UnifiedEngine:
                     "Total Score": round(score, 1),
                     "Rank IC": round(ic, 4),
                     "Weights": str(weights),
-                    "fundamentals": z_to_100(row['fundamentals']),
-                    "momentum": z_to_100(row['momentum']),
-                    "risk": z_to_100(row['risk']),
-                    "sentiment": z_to_100(row['sentiment'])
+                    "fundamentals": pillars_100["fundamentals"],
+                    "momentum": pillars_100["momentum"],
+                    "risk": pillars_100["risk"],
+                    "sentiment": pillars_100["sentiment"],
+                    "Explanation": explanation
                 })
         
         # 4. Final Aggregation
@@ -529,7 +578,7 @@ class UnifiedEngine:
         print("\n" + "="*80)
         print("FINAL MASTER LEADERBOARD (Aggregated from 4 Models)")
         print("="*80)
-        print(final_df[["Ticker", "Style", "Total Score", "Rank IC", "Weights"]].to_string(index=False))
+        print(final_df[["Ticker", "Style", "Total Score", "Rank IC", "Weights", "Explanation"]].to_string(index=False))
         
         return final_df.to_dict(orient='records')
 
